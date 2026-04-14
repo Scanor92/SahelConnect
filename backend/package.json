@@ -1,0 +1,30 @@
+{
+  "name": "sahelconnect-backend",
+  "version": "1.0.0",
+  "description": "API de gestion de ventes avec generation de recu PDF",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "node --watch src/server.js",
+    "start": "node src/server.js",
+    "migrate:sale-owners": "node src/scripts/backfill-sale-owners.js",
+    "seed:users14": "node src/scripts/seed-users-14.js",
+    "update:emails14": "node src/scripts/update-user-emails-sahelconnect.js"
+  },
+  "keywords": [
+    "express",
+    "mongodb",
+    "pdf"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^5.1.0",
+    "jsonwebtoken": "^9.0.3",
+    "mongoose": "^8.19.1",
+    "pdfkit": "^0.17.2",
+    "qrcode": "^1.5.4"
+  }
+}
