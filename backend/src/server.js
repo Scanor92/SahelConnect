@@ -14,6 +14,31 @@ const app = express();
 const port = process.env.PORT || 5000;
 const host = process.env.HOST || "0.0.0.0";
 
+function buildCorsConfig() {
+  const raw = String(process.env.CORS_ORIGIN || "").trim();
+  if (!raw) {
+    return {};
+  }
+  const allowedOrigins = raw
+    .split(",")
+    .map((value) => value.trim())
+    .filter(Boolean);
+
+  if (allowedOrigins.length === 0) {
+    return {};
+  }
+
+  return {
+    origin(origin, callback) {
+      if (!origin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+      callback(new Error("CORS non autorise"));
+    },
+  };
+}
+
 function getLocalIpv4() {
   const nets = os.networkInterfaces();
   for (const name of Object.keys(nets)) {
@@ -26,7 +51,7 @@ function getLocalIpv4() {
   return null;
 }
 
-app.use(cors());
+app.use(cors(buildCorsConfig()));
 app.use(express.json());
 
 app.get("/api/health", (req, res) => {

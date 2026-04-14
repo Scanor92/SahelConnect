@@ -53,6 +53,22 @@ cd backend
 npm run migrate:sale-owners
 ```
 
+Sauvegarde hors ligne (avant deployer):
+
+```bash
+cd backend
+npm run backup:offline
+```
+
+Le backup est cree dans `backend/backups/`.
+
+Restauration depuis un backup:
+
+```bash
+cd backend
+npm run restore:offline -- backups/sahelconnect-backup-YYYYMMDD-HHMMSS.json
+```
+
 Exemple `POST /api/sales`:
 
 ```json
@@ -72,9 +88,18 @@ npm start
 ```
 
 Important:
-- Dans `frontend/App.js`, configurez `API_BASE_URL` selon votre contexte:
-  - Emulateur Android: `http://10.0.2.2:5000`
-  - Telephone physique: IP locale de votre machine (ex: `http://192.168.1.87:5000`)
+- Configurez l'URL API mobile via variable Expo:
+  - `EXPO_PUBLIC_API_BASE_URL=http://10.0.2.2:5000` (emulateur Android)
+  - `EXPO_PUBLIC_API_BASE_URL=http://192.168.1.87:5000` (telephone local)
+  - `EXPO_PUBLIC_API_BASE_URL=https://api.sahelconnect.com` (production)
+
+Exemple PowerShell:
+
+```bash
+cd frontend
+$env:EXPO_PUBLIC_API_BASE_URL="https://api.sahelconnect.com"
+npm start
+```
 
 ## 5) Flux utilisateur
 
@@ -86,3 +111,13 @@ Important:
 4. Dans l'historique ou l'accueil, cliquer sur `Telecharger` pour enregistrer et envoyer le recu PDF
 
 Le backend enregistre la vente en base et genere le PDF dynamiquement.
+
+## 6) URLs production
+
+Variables backend (production):
+- `MONGODB_URI=mongodb+srv://...`
+- `JWT_SECRET=<secret-fort>`
+- `CORS_ORIGIN=https://ton-frontend.com,https://expo.dev`
+
+Variables frontend (production):
+- `EXPO_PUBLIC_API_BASE_URL=https://api.sahelconnect.com`

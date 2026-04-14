@@ -17,7 +17,9 @@ import { StatusBar } from "expo-status-bar";
 import * as FileSystem from "expo-file-system";
 import * as Sharing from "expo-sharing";
 
-const API_BASE_URL = "http://192.168.1.87:5000";
+const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "http://192.168.1.87:5000";
+const SALES_CACHE_FILE = `${FileSystem.documentDirectory}sahelconnect-sales-cache.json`;
+const MOBILE_BACKUP_FILE = `${FileSystem.documentDirectory}sahelconnect-mobile-backup.json`;
 
 function emptyLine() {
   return { productName: "", quantity: "", unitPrice: "" };
@@ -145,6 +147,7 @@ export default function App() {
   const [loadingWeeklyReport, setLoadingWeeklyReport] = useState(false);
   const [loadingRangeReport, setLoadingRangeReport] = useState(false);
   const [exportingReport, setExportingReport] = useState("");
+  const [offlineMode, setOfflineMode] = useState(false);
 
   const [productLines, setProductLines] = useState([emptyLine()]);
 
@@ -248,6 +251,55 @@ export default function App() {
     return sales.reduce((sum, item) => sum + Number(item.totalPrice || 0), 0);
   }, [sales]);
 
+  async function persistSalesOnMobile(nextSales) {
+    try {
+      const payload = {
+        savedAt: new Date().toISOString(),
+        user: currentUser || null,
+        sales: Array.isArray(nextSales) ? nextSales : [],
+      };
+      await FileSystem.writeAsStringAsync(SALES_CACHE_FILE, JSON.stringify(payload), {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+      await FileSystem.writeAsStringAsync(MOBILE_BACKUP_FILE, JSON.stringify(payload), {
+        encoding: FileSystem.EncodingType.UTF8,
+      });
+    } catch {
+      // no-op
+    }
+  }
+
+  async function readSalesFromMobileCache() {
+    try {
+      for (const filePath of [SALES_CACHE_FILE, MOBILE_BACKUP_FILE]) {
+        const fileInfo = await FileSystem.getInfoAsync(filePath);
+        if (!fileInfo.exists) {
+          continue;
+        }
+        const raw = await FileSystem.readAsStringAsync(filePath, {
+          encoding: FileSystem.EncodingType.UTF8,
+        });
+        const parsed = JSON.parse(raw);
+        if (Array.isArray(parsed?.sales)) {
+          return parsed.sales;
+        }
+      }
+      return [];
+    } catch {
+      return [];
+    }
+  }
+
+  useEffect(() => {
+    if (!authToken) {
+      return;
+    }
+    if (!Array.isArray(sales) || sales.length === 0) {
+      return;
+    }
+    persistSalesOnMobile(sales);
+  }, [sales, authToken, currentUser]);
+
   async function loadSales(filters = {}) {
     setLoadingHistory(true);
     try {
@@ -264,9 +316,18 @@ export default function App() {
 
       const query = params.toString();
       const data = await requestJson(`/api/sales${query ? `?${query}` : ""}`, {}, 12000);
-      setSales(data.sales || []);
+      const nextSales = data.sales || [];
+      setSales(nextSales);
+      await persistSalesOnMobile(nextSales);
+      setOfflineMode(false);
     } catch (error) {
-      Alert.alert("Erreur", error.message || "Impossible de charger les ventes.");
+      const cachedSales = await readSalesFromMobileCache();
+      if (cachedSales.length > 0) {
+        setSales(cachedSales);
+        setOfflineMode(true);
+      } else {
+        Alert.alert("Erreur", error.message || "Impossible de charger les ventes.");
+      }
     } finally {
       setLoadingHistory(false);
     }
@@ -971,6 +1032,7 @@ export default function App() {
       <View style={styles.panel}>
         <Text style={styles.panelTitle}>Tableau de bord</Text>
         <Text style={styles.panelSubtitle}>Acces rapide aux rapports de ventes.</Text>
+        {offlineMode ? <Text style={styles.offlineBadge}>Mode hors ligne actif (donnees du mobile)</Text> : null}
 
         <View style={styles.kpiGrid}>
           <View style={styles.kpiCard}>
@@ -1390,6 +1452,19 @@ const styles = StyleSheet.create({
     color: "#334155",
     fontWeight: "800",
     fontSize: 12,
+  },
+  offlineBadge: {
+    marginTop: 6,
+    color: "#92400e",
+    backgroundColor: "#fffbeb",
+    borderWidth: 1,
+    borderColor: "#fde68a",
+    borderRadius: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    fontWeight: "700",
+    fontSize: 12,
+    alignSelf: "flex-start",
   },
   reportTitle: {
     fontWeight: "800",

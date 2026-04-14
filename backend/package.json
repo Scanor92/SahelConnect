@@ -8,7 +8,9 @@
     "start": "node src/server.js",
     "migrate:sale-owners": "node src/scripts/backfill-sale-owners.js",
     "seed:users14": "node src/scripts/seed-users-14.js",
-    "update:emails14": "node src/scripts/update-user-emails-sahelconnect.js"
+    "update:emails14": "node src/scripts/update-user-emails-sahelconnect.js",
+    "backup:offline": "node src/scripts/backup-offline.js",
+    "restore:offline": "node src/scripts/restore-offline.js"
   },
   "keywords": [
     "express",
