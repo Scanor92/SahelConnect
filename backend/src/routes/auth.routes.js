@@ -1,9 +1,11 @@
 const express = require("express");
 const bcrypt = require("bcryptjs");
 const jwt = require("jsonwebtoken");
+const { getJwtSecret } = require("../config/security");
 const User = require("../models/User");
 
 const router = express.Router();
+const JWT_SECRET = getJwtSecret();
 
 router.post("/login", async (req, res) => {
   try {
@@ -30,7 +32,7 @@ router.post("/login", async (req, res) => {
         role: user.role,
         fullName: user.fullName,
       },
-      process.env.JWT_SECRET || "sahelconnect-dev-secret",
+      JWT_SECRET,
       { expiresIn: "12h" }
     );
 

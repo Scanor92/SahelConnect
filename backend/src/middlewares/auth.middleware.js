@@ -1,4 +1,7 @@
 const jwt = require("jsonwebtoken");
+const { getJwtSecret } = require("../config/security");
+
+const JWT_SECRET = getJwtSecret();
 
 function requireAuth(req, res, next) {
   const authHeader = req.headers.authorization || "";
@@ -9,7 +12,7 @@ function requireAuth(req, res, next) {
   }
 
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET || "sahelconnect-dev-secret");
+    const payload = jwt.verify(token, JWT_SECRET);
     req.user = payload;
     return next();
   } catch {

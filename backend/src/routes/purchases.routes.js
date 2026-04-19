@@ -1,9 +1,9 @@
-const express = require("express");
+﻿const express = require("express");
 const PDFDocument = require("pdfkit");
 const fs = require("fs");
 const path = require("path");
 const QRCode = require("qrcode");
-const Sale = require("../models/Sale");
+const Purchase = require("../models/Purchase");
 
 const router = express.Router();
 
@@ -68,6 +68,14 @@ function normalizeItemsFromPayload(payload) {
   ];
 }
 
+function normalizeSupplierFromPayload(payload) {
+  return String(payload?.supplier || "").trim();
+}
+
+function normalizeInvoiceRefFromPayload(payload) {
+  return String(payload?.invoiceRef || "").trim();
+}
+
 function validateItems(items) {
   if (!Array.isArray(items) || items.length === 0) {
     return "Ajoutez au moins un produit";
@@ -125,7 +133,7 @@ function getRangeBounds(from, to) {
   return { start, end };
 }
 
-function buildSalesFilter(query) {
+function buildPurchasesFilter(query) {
   const { q, from, to } = query || {};
   const filter = {};
 
@@ -150,14 +158,19 @@ function buildSalesFilter(query) {
   }
 
   if (q && String(q).trim()) {
-    filter["items.productName"] = { $regex: String(q).trim(), $options: "i" };
+    const safeQ = String(q).trim();
+    filter.$or = [
+      { "items.productName": { $regex: safeQ, $options: "i" } },
+      { supplier: { $regex: safeQ, $options: "i" } },
+      { invoiceRef: { $regex: safeQ, $options: "i" } },
+    ];
   }
 
   return filter;
 }
 
 function toCsvRows(sales) {
-  const rows = ["date,vente_id,produit,quantite,prix_unitaire,sous_total,total_vente"];
+  const rows = ["date,achat_id,ref_facture,fournisseur,produit,quantite,prix_unitaire,sous_total,total_achat"];
 
   sales.forEach((sale) => {
     const items = getSaleItems(sale);
@@ -167,6 +180,8 @@ function toCsvRows(sales) {
         [
           sale.createdAt.toISOString(),
           sale._id,
+          `"${String(sale.invoiceRef || "").replace(/"/g, '""')}"`,
+          `"${String(sale.supplier || "").replace(/"/g, '""')}"`,
           `"${safeName}"`,
           item.quantity,
           item.unitPrice,
@@ -213,7 +228,7 @@ function writeReportPdf(doc, title, subtitle, sales) {
 
   doc.roundedRect(40, 182, 252, 56, 10).fillAndStroke("#eef2ff", "#c7d2fe");
   doc.roundedRect(303, 182, 252, 56, 10).fillAndStroke("#ecfeff", "#a5f3fc");
-  doc.font("Helvetica").fontSize(10).fillColor("#3730a3").text("Nombre de ventes", 54, 198);
+  doc.font("Helvetica").fontSize(10).fillColor("#3730a3").text("Nombre d'achats", 54, 198);
   doc.font("Helvetica-Bold").fontSize(16).fillColor("#1e1b4b").text(String(sales.length), 54, 212);
   doc.font("Helvetica").fontSize(10).fillColor("#0f766e").text("Montant total", 317, 198);
   doc.font("Helvetica-Bold").fontSize(16).fillColor("#115e59").text(toMoney(totalAmount), 317, 212);
@@ -225,23 +240,33 @@ function writeReportPdf(doc, title, subtitle, sales) {
       y = 60;
     }
 
-    doc.roundedRect(40, y, 515, 74, 10).fillAndStroke("#ffffff", "#dbe5f0");
+    doc.roundedRect(40, y, 515, 106, 10).fillAndStroke("#ffffff", "#dbe5f0");
     doc
       .font("Helvetica-Bold")
       .fontSize(12)
       .fillColor("#0f172a")
-      .text(`Vente #${saleIndex + 1} - ${String(sale._id).slice(-8)}`, 54, y + 12);
+      .text(`Achat #${saleIndex + 1} - ${String(sale._id).slice(-8)}`, 54, y + 12);
     doc
       .font("Helvetica")
       .fontSize(10)
       .fillColor("#334155")
       .text(`Date: ${sale.createdAt.toLocaleString("fr-FR")}`, 54, y + 30);
     doc
+      .font("Helvetica")
+      .fontSize(10)
+      .fillColor("#334155")
+      .text(`Fournisseur: ${sale.supplier || "Achat comptoir"}`, 54, y + 46);
+    doc
+      .font("Helvetica")
+      .fontSize(10)
+      .fillColor("#334155")
+      .text(`Ref facture: ${sale.invoiceRef || "-"}`, 54, y + 62);
+    doc
       .font("Helvetica-Bold")
       .fontSize(11)
       .fillColor("#0f172a")
-      .text(`Total vente: ${toMoney(sale.totalPrice)}`, 54, y + 47);
-    y += 82;
+      .text(`Total achat: ${toMoney(sale.totalPrice)}`, 54, y + 78);
+    y += 114;
 
     const items = getSaleItems(sale);
     items.forEach((item, idx) => {
@@ -277,8 +302,8 @@ function writeReportPdf(doc, title, subtitle, sales) {
 
 router.get("/", async (req, res) => {
   try {
-    const filter = buildSalesFilter(req.query);
-    const sales = await Sale.find(filter).sort({ createdAt: -1 });
+    const filter = buildPurchasesFilter(req.query);
+    const sales = await Purchase.find(filter).sort({ createdAt: -1 });
     return res.json({ sales });
   } catch (error) {
     console.error(error);
@@ -299,7 +324,7 @@ router.get("/reports/daily", async (req, res) => {
     const end = new Date(baseDate);
     end.setHours(23, 59, 59, 999);
 
-    const sales = await Sale.find({ createdAt: { $gte: start, $lte: end } }).sort({
+    const sales = await Purchase.find({ createdAt: { $gte: start, $lte: end } }).sort({
       createdAt: -1,
     });
     const totalAmount = sales.reduce((sum, s) => sum + Number(s.totalPrice || 0), 0);
@@ -334,7 +359,7 @@ router.get("/reports/weekly", async (req, res) => {
     end.setDate(end.getDate() + 6);
     end.setHours(23, 59, 59, 999);
 
-    const sales = await Sale.find({ createdAt: { $gte: start, $lte: end } }).sort({
+    const sales = await Purchase.find({ createdAt: { $gte: start, $lte: end } }).sort({
       createdAt: -1,
     });
     const totalAmount = sales.reduce((sum, s) => sum + Number(s.totalPrice || 0), 0);
@@ -366,7 +391,7 @@ router.get("/reports/range", async (req, res) => {
     }
     const { start, end } = bounds;
 
-    const sales = await Sale.find({ createdAt: { $gte: start, $lte: end } }).sort({
+    const sales = await Purchase.find({ createdAt: { $gte: start, $lte: end } }).sort({
       createdAt: -1,
     });
     const totalAmount = sales.reduce((sum, s) => sum + Number(s.totalPrice || 0), 0);
@@ -398,7 +423,7 @@ router.get("/reports/daily/export.csv", async (req, res) => {
     const end = new Date(baseDate);
     end.setHours(23, 59, 59, 999);
 
-    const sales = await Sale.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
+    const sales = await Purchase.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
     const csv = toCsvRows(sales);
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
@@ -423,7 +448,7 @@ router.get("/reports/range/export.csv", async (req, res) => {
     }
     const { start, end } = bounds;
 
-    const sales = await Sale.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
+    const sales = await Purchase.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
     const csv = toCsvRows(sales);
 
     res.setHeader("Content-Type", "text/csv; charset=utf-8");
@@ -448,7 +473,7 @@ router.get("/reports/daily/export.pdf", async (req, res) => {
     const end = new Date(baseDate);
     end.setHours(23, 59, 59, 999);
 
-    const sales = await Sale.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
+    const sales = await Purchase.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
 
     const doc = new PDFDocument({ size: "A4", margins: { top: 40, bottom: 40, left: 50, right: 50 } });
     res.setHeader("Content-Type", "application/pdf");
@@ -457,7 +482,7 @@ router.get("/reports/daily/export.pdf", async (req, res) => {
     res.setHeader("Expires", "0");
     res.setHeader("Content-Disposition", `inline; filename=rapport-journalier-${start.toISOString().slice(0, 10)}.pdf`);
     doc.pipe(res);
-    writeReportPdf(doc, "Rapport Journalier des Ventes", `Date: ${start.toISOString().slice(0, 10)}`, sales);
+    writeReportPdf(doc, "Rapport Journalier des Achats", `Date: ${start.toISOString().slice(0, 10)}`, sales);
     doc.end();
   } catch (error) {
     console.error(error);
@@ -482,7 +507,7 @@ router.get("/reports/weekly/export.pdf", async (req, res) => {
     end.setDate(end.getDate() + 6);
     end.setHours(23, 59, 59, 999);
 
-    const sales = await Sale.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
+    const sales = await Purchase.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
 
     const doc = new PDFDocument({ size: "A4", margins: { top: 40, bottom: 40, left: 50, right: 50 } });
     res.setHeader("Content-Type", "application/pdf");
@@ -518,7 +543,7 @@ router.get("/reports/range/export.pdf", async (req, res) => {
       return res.status(400).json({ message: "from doit etre inferieur ou egal a to" });
     }
     const { start, end } = bounds;
-    const sales = await Sale.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
+    const sales = await Purchase.find({ createdAt: { $gte: start, $lte: end } }).sort({ createdAt: -1 });
 
     const doc = new PDFDocument({ size: "A4", margins: { top: 40, bottom: 40, left: 50, right: 50 } });
     res.setHeader("Content-Type", "application/pdf");
@@ -532,7 +557,7 @@ router.get("/reports/range/export.pdf", async (req, res) => {
     doc.pipe(res);
     writeReportPdf(
       doc,
-      "Rapport des Ventes par Intervalle",
+      "Rapport des Achats par Intervalle",
       `Du ${start.toISOString().slice(0, 10)} au ${end.toISOString().slice(0, 10)}`,
       sales
     );
@@ -554,16 +579,20 @@ router.post("/", async (req, res) => {
 
     const totalPrice = items.reduce((sum, item) => sum + item.lineTotal, 0);
 
-    const sale = await Sale.create({
+    const supplier = normalizeSupplierFromPayload(req.body || {});
+    const invoiceRef = normalizeInvoiceRefFromPayload(req.body || {});
+    const sale = await Purchase.create({
       items,
       totalPrice,
+      supplier,
+      invoiceRef,
       createdBy: req.user?.sub,
     });
 
     return res.status(201).json({
-      message: "Vente enregistree",
+      message: "Achat enregistre",
       sale,
-      receiptUrl: `/api/sales/${sale._id}/receipt`,
+      receiptUrl: `/api/purchases/${sale._id}/receipt`,
     });
   } catch (error) {
     console.error(error);
@@ -574,15 +603,15 @@ router.post("/", async (req, res) => {
 router.put("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const existingSale = await Sale.findById(id);
+    const existingSale = await Purchase.findById(id);
     if (!existingSale) {
-      return res.status(404).json({ message: "Vente introuvable" });
+      return res.status(404).json({ message: "Achat introuvable" });
     }
 
     const isOwner = normalizeUserId(existingSale.createdBy) === normalizeUserId(req.user?.sub);
     const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
     if (!isOwner && !isAdmin) {
-      return res.status(403).json({ message: "Vous pouvez modifier uniquement vos ventes" });
+      return res.status(403).json({ message: "Vous pouvez modifier uniquement vos achats" });
     }
 
     const items = normalizeItemsFromPayload(req.body || {});
@@ -594,20 +623,24 @@ router.put("/:id", async (req, res) => {
 
     const totalPrice = items.reduce((sum, item) => sum + item.lineTotal, 0);
 
-    const updatedSale = await Sale.findByIdAndUpdate(
+    const supplier = normalizeSupplierFromPayload(req.body || {});
+    const invoiceRef = normalizeInvoiceRefFromPayload(req.body || {});
+    const updatedSale = await Purchase.findByIdAndUpdate(
       existingSale._id,
       {
         items,
         totalPrice,
+        supplier,
+        invoiceRef,
       },
       { new: true, runValidators: true }
     );
 
     if (!updatedSale) {
-      return res.status(404).json({ message: "Vente introuvable" });
+      return res.status(404).json({ message: "Achat introuvable" });
     }
 
-    return res.json({ message: "Vente modifiee", sale: updatedSale });
+    return res.json({ message: "Achat modifie", sale: updatedSale });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Erreur serveur" });
@@ -617,20 +650,20 @@ router.put("/:id", async (req, res) => {
 router.delete("/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const sale = await Sale.findById(id);
+    const sale = await Purchase.findById(id);
 
     if (!sale) {
-      return res.status(404).json({ message: "Vente introuvable" });
+      return res.status(404).json({ message: "Achat introuvable" });
     }
 
     const isOwner = normalizeUserId(sale.createdBy) === normalizeUserId(req.user?.sub);
     const isAdmin = String(req.user?.role || "").toLowerCase() === "admin";
     if (!isOwner && !isAdmin) {
-      return res.status(403).json({ message: "Vous pouvez supprimer uniquement vos ventes" });
+      return res.status(403).json({ message: "Vous pouvez supprimer uniquement vos achats" });
     }
 
-    await Sale.deleteOne({ _id: sale._id });
-    return res.json({ message: "Vente supprimee" });
+    await Purchase.deleteOne({ _id: sale._id });
+    return res.json({ message: "Achat supprime" });
   } catch (error) {
     console.error(error);
     return res.status(500).json({ message: "Erreur serveur" });
@@ -640,7 +673,7 @@ router.delete("/:id", async (req, res) => {
 router.get("/:id/verify", async (req, res) => {
   try {
     const { id } = req.params;
-    const sale = await Sale.findById(id);
+    const sale = await Purchase.findById(id);
 
     if (!sale) {
       return res.status(404).json({
@@ -656,6 +689,8 @@ router.get("/:id/verify", async (req, res) => {
         id: sale._id,
         items: getSaleItems(sale),
         totalPrice: sale.totalPrice,
+        supplier: sale.supplier || "",
+        invoiceRef: sale.invoiceRef || "",
         createdAt: sale.createdAt,
       },
     });
@@ -668,10 +703,10 @@ router.get("/:id/verify", async (req, res) => {
 router.get("/:id/receipt", async (req, res) => {
   try {
     const { id } = req.params;
-    const sale = await Sale.findById(id);
+    const sale = await Purchase.findById(id);
 
     if (!sale) {
-      return res.status(404).json({ message: "Vente introuvable" });
+      return res.status(404).json({ message: "Achat introuvable" });
     }
 
     const items = getSaleItems(sale);
@@ -682,7 +717,7 @@ router.get("/:id/receipt", async (req, res) => {
       info: {
         Title: `Recu ${sale._id}`,
         Author: "SahelConnect",
-        Subject: "Recu de vente",
+        Subject: "Recu d'achat",
       },
     });
 
@@ -699,7 +734,7 @@ router.get("/:id/receipt", async (req, res) => {
       doc.image(logoPath, 50, 118, { fit: [130, 48], align: "left" });
     }
 
-    const verificationUrl = `${getBaseUrl(req)}/api/sales/${sale._id}/verify`;
+    const verificationUrl = `${getBaseUrl(req)}/api/purchases/${sale._id}/verify`;
     const qrDataUrl = await QRCode.toDataURL(verificationUrl, {
       errorCorrectionLevel: "H",
       margin: 1,
@@ -707,7 +742,7 @@ router.get("/:id/receipt", async (req, res) => {
     });
     const qrImageBuffer = Buffer.from(qrDataUrl.split(",")[1], "base64");
 
-    doc.font("Helvetica-Bold").fontSize(20).fillColor("#0f172a").text("RECU DE VENTE", 50, 182, { align: "center" });
+    doc.font("Helvetica-Bold").fontSize(20).fillColor("#0f172a").text("Recu d'achat", 50, 182, { align: "center" });
 
     doc.strokeColor("#cbd5e1").lineWidth(1).moveTo(50, 220).lineTo(545, 220).stroke();
 
@@ -717,16 +752,17 @@ router.get("/:id/receipt", async (req, res) => {
       .fillColor("#334155")
       .text(`Numero du recu: ${sale._id}`, 50, 236)
       .text(`Date: ${sale.createdAt.toLocaleString("fr-FR")}`, 50, 252)
-      .text("Client: Vente comptoir", 50, 268);
+      .text(`Fournisseur: ${sale.supplier || "Achat comptoir"}`, 50, 268)
+      .text(`Ref facture: ${sale.invoiceRef || "-"}`, 50, 284);
 
-    const detailsY = 302;
+    const detailsY = 318;
     const headerH = 28;
     const rowH = 24;
     const detailsH = headerH + rowH * Math.max(items.length, 1) + 18;
 
     doc.roundedRect(50, detailsY, 495, detailsH, 8).fillAndStroke("#f8fafc", "#cbd5e1");
 
-    doc.fillColor("#0f172a").font("Helvetica-Bold").fontSize(12).text("Details de la vente", 65, detailsY + 12);
+    doc.fillColor("#0f172a").font("Helvetica-Bold").fontSize(12).text("Details de l'achat", 65, detailsY + 12);
 
     let rowY = detailsY + 40;
     items.forEach((item, index) => {
@@ -742,7 +778,7 @@ router.get("/:id/receipt", async (req, res) => {
     const totalY = detailsY + detailsH + 18;
     doc.roundedRect(50, totalY, 495, 72, 8).fillAndStroke("#eef2ff", "#a5b4fc");
 
-    doc.font("Helvetica").fontSize(11).fillColor("#3730a3").text("Montant total regle", 65, totalY + 19);
+    doc.font("Helvetica").fontSize(11).fillColor("#3730a3").text("Montant total achat", 65, totalY + 19);
     doc.font("Helvetica-Bold").fontSize(24).fillColor("#1e1b4b").text(toMoney(sale.totalPrice), 65, totalY + 36);
 
     doc.font("Helvetica-Bold").fontSize(10).fillColor("#0f172a").text("Document authentique - SAHELCONNECT", 50, 560, {
@@ -773,3 +809,4 @@ router.get("/:id/receipt", async (req, res) => {
 });
 
 module.exports = router;
+

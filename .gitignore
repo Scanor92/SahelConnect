@@ -3,6 +3,7 @@ node_modules/
 
 .expo/
 frontend/.expo/
+frontend/dist/
 
 .env
 backend/.env
@@ -16,3 +17,4 @@ yarn-error.log*
 
 .DS_Store
 Thumbs.db
+backend/Capture d'écran *.png

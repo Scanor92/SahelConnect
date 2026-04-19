@@ -5,10 +5,12 @@ const cors = require("cors");
 const os = require("os");
 const bcrypt = require("bcryptjs");
 const { connectDatabase } = require("./config/database");
+const { getJwtSecret, isProduction, shouldBootstrapDefaultAdmin } = require("./config/security");
 const User = require("./models/User");
 const { requireAuth } = require("./middlewares/auth.middleware");
 const authRouter = require("./routes/auth.routes");
 const salesRouter = require("./routes/sales.routes");
+const purchasesRouter = require("./routes/purchases.routes");
 
 const app = express();
 const port = process.env.PORT || 5000;
@@ -16,6 +18,9 @@ const host = process.env.HOST || "0.0.0.0";
 
 function buildCorsConfig() {
   const raw = String(process.env.CORS_ORIGIN || "").trim();
+  if (!raw && isProduction()) {
+    throw new Error("CORS_ORIGIN est obligatoire en production.");
+  }
   if (!raw) {
     return {};
   }
@@ -60,8 +65,14 @@ app.get("/api/health", (req, res) => {
 
 app.use("/api/auth", authRouter);
 app.use("/api/sales", requireAuth, salesRouter);
+app.use("/api/purchases", requireAuth, purchasesRouter);
 
 async function ensureDefaultAdminUser() {
+  if (!shouldBootstrapDefaultAdmin()) {
+    console.warn("Creation de l'admin par defaut ignoree en production (config manquante/insecure).");
+    return;
+  }
+
   const adminEmail = (process.env.DEFAULT_ADMIN_EMAIL || "admin@sahelconnect.com").toLowerCase().trim();
   const adminPassword = process.env.DEFAULT_ADMIN_PASSWORD || "Admin@1234";
   const adminName = process.env.DEFAULT_ADMIN_NAME || "Administrateur";
@@ -84,6 +95,8 @@ async function ensureDefaultAdminUser() {
 
 connectDatabase()
   .then(() => {
+    // Force la validation de JWT_SECRET au demarrage.
+    getJwtSecret();
     return ensureDefaultAdminUser();
   })
   .then(() => {

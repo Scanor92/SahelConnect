@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+﻿import React, { useEffect, useMemo, useState } from "react";
 import {
   ActivityIndicator,
   Alert,
@@ -14,12 +14,84 @@ import {
   View,
 } from "react-native";
 import { StatusBar } from "expo-status-bar";
-import * as FileSystem from "expo-file-system";
-import * as Sharing from "expo-sharing";
 
-const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "http://192.168.1.87:5000";
-const SALES_CACHE_FILE = `${FileSystem.documentDirectory}sahelconnect-sales-cache.json`;
-const MOBILE_BACKUP_FILE = `${FileSystem.documentDirectory}sahelconnect-mobile-backup.json`;
+const API_BASE_URL = process.env.EXPO_PUBLIC_API_BASE_URL || "https://sahelconnect.onrender.com";
+const MODULE_CACHE_PREFIX = "sahelconnect-cache";
+const MOBILE_BACKUP_PREFIX = "sahelconnect-mobile-backup";
+let sharingModulePromise = null;
+let fileSystemModulePromise = null;
+
+async function getSharingModule() {
+  if (!sharingModulePromise) {
+    sharingModulePromise = import("expo-sharing")
+      .then((mod) => mod)
+      .catch(() => null);
+  }
+  return sharingModulePromise;
+}
+
+async function getFileSystemModule() {
+  if (!fileSystemModulePromise) {
+    fileSystemModulePromise = import("expo-file-system")
+      .then((mod) => mod)
+      .catch(() => null);
+  }
+  return fileSystemModulePromise;
+}
+
+async function openPdfWithBestEffort(localPdfUri, dialogTitle = "Apercu PDF") {
+  if (!localPdfUri) {
+    return false;
+  }
+
+  const FileSystem = await getFileSystemModule();
+
+  if (Platform.OS === "android" && FileSystem?.getContentUriAsync) {
+    try {
+      const contentUri = await FileSystem.getContentUriAsync(localPdfUri);
+      if (contentUri) {
+        const canOpenContentUri = await Linking.canOpenURL(contentUri);
+        if (canOpenContentUri) {
+          await Linking.openURL(contentUri);
+          return true;
+        }
+      }
+    } catch {
+      // On continue avec les autres strategies.
+    }
+  }
+
+  try {
+    const canOpenFile = await Linking.canOpenURL(localPdfUri);
+    if (canOpenFile) {
+      await Linking.openURL(localPdfUri);
+      return true;
+    }
+  } catch {
+    // On continue avec le partage.
+  }
+
+  const Sharing = await getSharingModule();
+  const canShare = Sharing ? await Sharing.isAvailableAsync() : false;
+  if (Sharing && canShare) {
+    await Sharing.shareAsync(localPdfUri, {
+      mimeType: "application/pdf",
+      dialogTitle,
+      UTI: "com.adobe.pdf",
+    });
+    return true;
+  }
+
+  return false;
+}
+
+function getDocumentFileUri(FileSystem, filename) {
+  const baseDir = FileSystem?.documentDirectory;
+  if (!baseDir) {
+    return null;
+  }
+  return `${baseDir}${filename}`;
+}
 
 function emptyLine() {
   return { productName: "", quantity: "", unitPrice: "" };
@@ -79,6 +151,11 @@ function linesTotal(lines) {
   }, 0);
 }
 
+function formatMoney(value) {
+  const amount = Math.round(Number(value) || 0);
+  return `${amount.toLocaleString("fr-FR")} XOF`;
+}
+
 function formatYmd(dateValue) {
   const date = new Date(dateValue);
   if (Number.isNaN(date.getTime())) {
@@ -113,14 +190,37 @@ function monthLabel(date) {
   return date.toLocaleDateString("fr-FR", { month: "long", year: "numeric" });
 }
 
-export default function App() {
+function moduleConfig(moduleKey) {
+  if (moduleKey === "purchases") {
+    return {
+      key: "purchases",
+      singular: "Achat",
+      plural: "Achats",
+      reportPluralLower: "achats",
+      apiBase: "/api/purchases",
+      receiptName: "recu-achat",
+    };
+  }
+
+  return {
+    key: "sales",
+    singular: "Vente",
+    plural: "Ventes",
+    reportPluralLower: "ventes",
+    apiBase: "/api/sales",
+    receiptName: "recu-vente",
+  };
+}
+
+function MainApp() {
   const [authToken, setAuthToken] = useState("");
   const [currentUser, setCurrentUser] = useState(null);
-  const [loginEmail, setLoginEmail] = useState("admin@sahelconnect.com");
-  const [loginPassword, setLoginPassword] = useState("Admin@1234");
+  const [loginEmail, setLoginEmail] = useState("");
+  const [loginPassword, setLoginPassword] = useState("");
   const [loggingIn, setLoggingIn] = useState(false);
 
   const [tab, setTab] = useState("home");
+  const [activeModule, setActiveModule] = useState("sales");
   const [sales, setSales] = useState([]);
   const [loadingHistory, setLoadingHistory] = useState(false);
   const [loadingCreate, setLoadingCreate] = useState(false);
@@ -150,18 +250,38 @@ export default function App() {
   const [offlineMode, setOfflineMode] = useState(false);
 
   const [productLines, setProductLines] = useState([emptyLine()]);
+  const [supplierName, setSupplierName] = useState("");
+  const [invoiceRef, setInvoiceRef] = useState("");
 
   const [editingId, setEditingId] = useState("");
   const [editLines, setEditLines] = useState([emptyLine()]);
+  const [editSupplierName, setEditSupplierName] = useState("");
+  const [editInvoiceRef, setEditInvoiceRef] = useState("");
   const [savingEdit, setSavingEdit] = useState(false);
 
   const currentUserId = useMemo(() => normalizeOwnerId(currentUser?.id), [currentUser]);
+  const activeModuleConfig = useMemo(() => moduleConfig(activeModule), [activeModule]);
 
   function withTimeout(promise, timeoutMs = 12000) {
     return Promise.race([
       promise,
       new Promise((_, reject) => setTimeout(() => reject(new Error("TIMEOUT")), timeoutMs)),
     ]);
+  }
+
+  function toHttpError(status) {
+    return `HTTP_${status}`;
+  }
+
+  function parseHttpStatusFromError(message) {
+    if (!message || typeof message !== "string") {
+      return 0;
+    }
+    if (!message.startsWith("HTTP_")) {
+      return 0;
+    }
+    const status = Number(message.replace("HTTP_", ""));
+    return Number.isFinite(status) ? status : 0;
   }
 
   async function requestJson(path, options = {}, timeoutMs = 12000) {
@@ -194,6 +314,18 @@ export default function App() {
     return data;
   }
 
+  function getActiveApiBase() {
+    return activeModuleConfig.apiBase;
+  }
+
+  function getCacheFileName() {
+    return `${MODULE_CACHE_PREFIX}-${activeModuleConfig.key}.json`;
+  }
+
+  function getBackupFileName() {
+    return `${MOBILE_BACKUP_PREFIX}-${activeModuleConfig.key}.json`;
+  }
+
   useEffect(() => {
     if (!authToken) {
       return;
@@ -201,7 +333,7 @@ export default function App() {
     loadSales();
     loadDailyReport(reportDate);
     loadWeeklyReport(weeklyDate);
-  }, [authToken]);
+  }, [authToken, activeModule]);
 
   useEffect(() => {
     if (!authToken) {
@@ -214,7 +346,17 @@ export default function App() {
         loadWeeklyReport(weeklyDate);
       }
     }
-  }, [tab, authToken]);
+  }, [tab, authToken, activeModule]);
+
+  useEffect(() => {
+    setReportScreen("menu");
+    setShowDailyDetails(false);
+    setShowWeeklyDetails(false);
+    setShowRangeDetails(false);
+    setSupplierName("");
+    setInvoiceRef("");
+    cancelEdit();
+  }, [activeModule]);
 
   async function handleLogin() {
     if (!loginEmail || !loginPassword) {
@@ -253,15 +395,22 @@ export default function App() {
 
   async function persistSalesOnMobile(nextSales) {
     try {
+      const FileSystem = await getFileSystemModule();
+      const salesCacheFile = getDocumentFileUri(FileSystem, getCacheFileName());
+      const backupFile = getDocumentFileUri(FileSystem, getBackupFileName());
+      if (!FileSystem || !salesCacheFile || !backupFile) {
+        return;
+      }
+
       const payload = {
         savedAt: new Date().toISOString(),
         user: currentUser || null,
         sales: Array.isArray(nextSales) ? nextSales : [],
       };
-      await FileSystem.writeAsStringAsync(SALES_CACHE_FILE, JSON.stringify(payload), {
+      await FileSystem.writeAsStringAsync(salesCacheFile, JSON.stringify(payload), {
         encoding: FileSystem.EncodingType.UTF8,
       });
-      await FileSystem.writeAsStringAsync(MOBILE_BACKUP_FILE, JSON.stringify(payload), {
+      await FileSystem.writeAsStringAsync(backupFile, JSON.stringify(payload), {
         encoding: FileSystem.EncodingType.UTF8,
       });
     } catch {
@@ -271,7 +420,14 @@ export default function App() {
 
   async function readSalesFromMobileCache() {
     try {
-      for (const filePath of [SALES_CACHE_FILE, MOBILE_BACKUP_FILE]) {
+      const FileSystem = await getFileSystemModule();
+      const salesCacheFile = getDocumentFileUri(FileSystem, getCacheFileName());
+      const backupFile = getDocumentFileUri(FileSystem, getBackupFileName());
+      if (!FileSystem || !salesCacheFile || !backupFile) {
+        return [];
+      }
+
+      for (const filePath of [salesCacheFile, backupFile]) {
         const fileInfo = await FileSystem.getInfoAsync(filePath);
         if (!fileInfo.exists) {
           continue;
@@ -315,7 +471,7 @@ export default function App() {
       }
 
       const query = params.toString();
-      const data = await requestJson(`/api/sales${query ? `?${query}` : ""}`, {}, 12000);
+      const data = await requestJson(`${getActiveApiBase()}${query ? `?${query}` : ""}`, {}, 12000);
       const nextSales = data.sales || [];
       setSales(nextSales);
       await persistSalesOnMobile(nextSales);
@@ -326,7 +482,7 @@ export default function App() {
         setSales(cachedSales);
         setOfflineMode(true);
       } else {
-        Alert.alert("Erreur", error.message || "Impossible de charger les ventes.");
+        Alert.alert("Erreur", error.message || `Impossible de charger les ${activeModuleConfig.reportPluralLower}.`);
       }
     } finally {
       setLoadingHistory(false);
@@ -337,7 +493,7 @@ export default function App() {
     setLoadingDailyReport(true);
     try {
       const safeDate = dateValue || new Date().toISOString().slice(0, 10);
-      const data = await requestJson(`/api/sales/reports/daily?date=${encodeURIComponent(safeDate)}`);
+      const data = await requestJson(`${getActiveApiBase()}/reports/daily?date=${encodeURIComponent(safeDate)}`);
       setDailyReport(data);
       return true;
     } catch (error) {
@@ -352,7 +508,7 @@ export default function App() {
     setLoadingWeeklyReport(true);
     try {
       const safeDate = dateValue || new Date().toISOString().slice(0, 10);
-      const data = await requestJson(`/api/sales/reports/weekly?date=${encodeURIComponent(safeDate)}`);
+      const data = await requestJson(`${getActiveApiBase()}/reports/weekly?date=${encodeURIComponent(safeDate)}`);
       setWeeklyReport(data);
       return true;
     } catch (error) {
@@ -372,7 +528,7 @@ export default function App() {
     setLoadingRangeReport(true);
     try {
       const data = await requestJson(
-        `/api/sales/reports/range?from=${encodeURIComponent(rangeFrom)}&to=${encodeURIComponent(rangeTo)}`
+        `${getActiveApiBase()}/reports/range?from=${encodeURIComponent(rangeFrom)}&to=${encodeURIComponent(rangeTo)}`
       );
       setRangeReport(data);
       return true;
@@ -470,27 +626,35 @@ export default function App() {
 
     setLoadingCreate(true);
     try {
-      await requestJson("/api/sales", {
+      const payload = { items: lines };
+      if (activeModule === "purchases") {
+        payload.supplier = supplierName.trim();
+        payload.invoiceRef = invoiceRef.trim();
+      }
+      await requestJson(getActiveApiBase(), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items: lines }),
+        body: JSON.stringify(payload),
       });
 
       setProductLines([emptyLine()]);
+      setSupplierName("");
+      setInvoiceRef("");
       await loadSales();
       setTab("history");
-      Alert.alert("Succes", "Vente enregistree.");
+      Alert.alert("Succes", `${activeModuleConfig.singular} enregistree.`);
     } catch (error) {
-      Alert.alert("Erreur", error.message || "Impossible d'enregistrer la vente.");
+      Alert.alert("Erreur", error.message || `Impossible d'enregistrer ${activeModuleConfig.singular.toLowerCase()}.`);
     } finally {
       setLoadingCreate(false);
     }
   }
 
   function startEdit(item) {
+    const isAdmin = String(currentUser?.role || "").toLowerCase() === "admin";
     const ownerId = normalizeOwnerId(item?.createdBy);
-    if (!ownerId || ownerId !== currentUserId) {
-      Alert.alert("Action non autorisee", "Vous pouvez modifier uniquement vos ventes.");
+    if (!isAdmin && (!ownerId || ownerId !== currentUserId)) {
+      Alert.alert("Action non autorisee", `Vous pouvez modifier uniquement vos ${activeModuleConfig.reportPluralLower}.`);
       return;
     }
 
@@ -501,12 +665,16 @@ export default function App() {
       unitPrice: String(line.unitPrice),
     }));
 
+    setEditSupplierName(String(item?.supplier || ""));
+    setEditInvoiceRef(String(item?.invoiceRef || ""));
     setEditLines(lines.length > 0 ? lines : [emptyLine()]);
   }
 
   function cancelEdit() {
     setEditingId("");
     setEditLines([emptyLine()]);
+    setEditSupplierName("");
+    setEditInvoiceRef("");
   }
 
   async function saveEdit() {
@@ -524,38 +692,44 @@ export default function App() {
 
     setSavingEdit(true);
     try {
-      await requestJson(`/api/sales/${editingId}`, {
+      const payload = { items: lines };
+      if (activeModule === "purchases") {
+        payload.supplier = editSupplierName.trim();
+        payload.invoiceRef = editInvoiceRef.trim();
+      }
+      await requestJson(`${getActiveApiBase()}/${editingId}`, {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items: lines }),
+        body: JSON.stringify(payload),
       });
 
       cancelEdit();
       await loadSales();
-      Alert.alert("Succes", "Vente modifiee.");
+      Alert.alert("Succes", `${activeModuleConfig.singular} modifiee.`);
     } catch (error) {
-      Alert.alert("Erreur", error.message || "Impossible de modifier la vente.");
+      Alert.alert("Erreur", error.message || `Impossible de modifier ${activeModuleConfig.singular.toLowerCase()}.`);
     } finally {
       setSavingEdit(false);
     }
   }
 
   function confirmDelete(id) {
+    const isAdmin = String(currentUser?.role || "").toLowerCase() === "admin";
     const sale = sales.find((s) => s._id === id);
     const ownerId = normalizeOwnerId(sale?.createdBy);
-    if (!ownerId || ownerId !== currentUserId) {
-      Alert.alert("Action non autorisee", "Vous pouvez supprimer uniquement vos ventes.");
+    if (!isAdmin && (!ownerId || ownerId !== currentUserId)) {
+      Alert.alert("Action non autorisee", `Vous pouvez supprimer uniquement vos ${activeModuleConfig.reportPluralLower}.`);
       return;
     }
 
-    Alert.alert("Confirmation", "Supprimer cette vente ?", [
+    Alert.alert("Confirmation", `Supprimer cette ${activeModuleConfig.singular.toLowerCase()} ?`, [
       { text: "Annuler", style: "cancel" },
       {
         text: "Supprimer",
         style: "destructive",
         onPress: async () => {
           try {
-            await requestJson(`/api/sales/${id}`, { method: "DELETE" });
+            await requestJson(`${getActiveApiBase()}/${id}`, { method: "DELETE" });
             if (editingId === id) {
               cancelEdit();
             }
@@ -570,15 +744,34 @@ export default function App() {
 
   async function downloadAndShareReceipt(id, name) {
     try {
+      if (!authToken) {
+        Alert.alert("Session expiree", "Veuillez vous reconnecter.");
+        return;
+      }
       setDownloadingId(id);
+      const FileSystem = await getFileSystemModule();
+      const baseDir = FileSystem?.documentDirectory;
+      if (!FileSystem || !baseDir) {
+        Alert.alert("Erreur", "Stockage local indisponible sur cet appareil.");
+        return;
+      }
+
       const safeName = String(name || "produit").replace(/[^a-zA-Z0-9_-]/g, "-").toLowerCase();
-      const fileUri = `${FileSystem.documentDirectory}recu-${safeName}-${id}.pdf`;
-      const remoteUrl = `${API_BASE_URL}/api/sales/${id}/receipt`;
+      const fileUri = `${baseDir}${activeModuleConfig.receiptName}-${safeName}-${id}.pdf`;
+      const remoteUrl = `${API_BASE_URL}${getActiveApiBase()}/${id}/receipt`;
+      const receiptDownload = await withTimeout(
+        FileSystem.downloadAsync(remoteUrl, fileUri, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        15000
+      );
+      if (receiptDownload?.status && receiptDownload.status >= 400) {
+        throw new Error(receiptDownload.status === 401 ? "AUTH_REQUIRED" : toHttpError(receiptDownload.status));
+      }
 
-      await withTimeout(FileSystem.downloadAsync(remoteUrl, fileUri), 15000);
-
-      const canShare = await Sharing.isAvailableAsync();
-      if (canShare) {
+      const Sharing = await getSharingModule();
+      const canShare = Sharing ? await Sharing.isAvailableAsync() : false;
+      if (Sharing && canShare) {
         await Sharing.shareAsync(fileUri, {
           mimeType: "application/pdf",
           dialogTitle: "Envoyer le recu",
@@ -588,8 +781,15 @@ export default function App() {
         Alert.alert("Telechargement termine", `Recu sauvegarde: ${fileUri}`);
       }
     } catch (error) {
+      const httpStatus = parseHttpStatusFromError(error?.message);
       if (error.message === "TIMEOUT") {
         Alert.alert("Timeout", "Le telechargement du recu a pris trop de temps.");
+      } else if (error.message === "AUTH_REQUIRED") {
+        Alert.alert("Session expiree", "Authentification requise. Veuillez vous reconnecter.");
+      } else if (httpStatus === 404) {
+        Alert.alert("Erreur serveur", "Route de recu introuvable (404).");
+      } else if (httpStatus >= 500) {
+        Alert.alert("Erreur serveur", "Le serveur a retourne une erreur lors du recu.");
       } else {
         Alert.alert("Erreur", "Impossible de telecharger le recu PDF.");
       }
@@ -600,18 +800,45 @@ export default function App() {
 
   async function openReceiptPreview(id) {
     try {
+      if (!authToken) {
+        Alert.alert("Session expiree", "Veuillez vous reconnecter.");
+        return;
+      }
       setPreviewingId(id);
-      const url = `${API_BASE_URL}/api/sales/${id}/receipt`;
-      const canOpen = await Linking.canOpenURL(url);
-
-      if (!canOpen) {
-        Alert.alert("Erreur", "Impossible d'ouvrir l'apercu du recu.");
+      const FileSystem = await getFileSystemModule();
+      const baseDir = FileSystem?.documentDirectory;
+      if (!FileSystem || !baseDir) {
+        Alert.alert("Erreur", "Stockage local indisponible sur cet appareil.");
         return;
       }
 
-      await Linking.openURL(url);
-    } catch {
-      Alert.alert("Erreur", "Impossible d'ouvrir l'apercu du recu.");
+      const previewUri = `${baseDir}apercu-${activeModuleConfig.receiptName}-${id}-${Date.now()}.pdf`;
+      const downloadResult = await withTimeout(
+        FileSystem.downloadAsync(`${API_BASE_URL}${getActiveApiBase()}/${id}/receipt`, previewUri, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        15000
+      );
+      if (downloadResult?.status && downloadResult.status >= 400) {
+        throw new Error(downloadResult.status === 401 ? "AUTH_REQUIRED" : toHttpError(downloadResult.status));
+      }
+
+      const localPdfUri = downloadResult?.uri || previewUri;
+      const opened = await openPdfWithBestEffort(localPdfUri, "Apercu du recu");
+      if (!opened) {
+        Alert.alert("Erreur", "Aucun lecteur PDF disponible pour l'apercu.");
+      }
+    } catch (error) {
+      const httpStatus = parseHttpStatusFromError(error?.message);
+      if (error.message === "AUTH_REQUIRED") {
+        Alert.alert("Session expiree", "Authentification requise. Veuillez vous reconnecter.");
+      } else if (httpStatus === 404) {
+        Alert.alert("Erreur serveur", "Route d'apercu recu introuvable (404).");
+      } else if (httpStatus >= 500) {
+        Alert.alert("Erreur serveur", "Le serveur a retourne une erreur lors de l'apercu.");
+      } else {
+        Alert.alert("Erreur", "Impossible d'ouvrir l'apercu du recu.");
+      }
     } finally {
       setPreviewingId("");
     }
@@ -619,15 +846,35 @@ export default function App() {
 
   async function exportReportPdf(path, filename, exportKey) {
     try {
+      if (!authToken) {
+        Alert.alert("Session expiree", "Veuillez vous reconnecter.");
+        return;
+      }
       setExportingReport(exportKey);
+      const FileSystem = await getFileSystemModule();
+      const baseDir = FileSystem?.documentDirectory;
+      if (!FileSystem || !baseDir) {
+        Alert.alert("Erreur", "Stockage local indisponible sur cet appareil.");
+        return;
+      }
+
       const timestamp = Date.now();
       const freshPath = `${path}${path.includes("?") ? "&" : "?"}_t=${timestamp}`;
       const finalFilename = filename.replace(/\.pdf$/i, `-${timestamp}.pdf`);
-      const fileUri = `${FileSystem.documentDirectory}${finalFilename}`;
-      await withTimeout(FileSystem.downloadAsync(`${API_BASE_URL}${freshPath}`, fileUri), 20000);
+      const fileUri = `${baseDir}${finalFilename}`;
+      const reportDownload = await withTimeout(
+        FileSystem.downloadAsync(`${API_BASE_URL}${freshPath}`, fileUri, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        20000
+      );
+      if (reportDownload?.status && reportDownload.status >= 400) {
+        throw new Error(reportDownload.status === 401 ? "AUTH_REQUIRED" : toHttpError(reportDownload.status));
+      }
 
-      const canShare = await Sharing.isAvailableAsync();
-      if (canShare) {
+      const Sharing = await getSharingModule();
+      const canShare = Sharing ? await Sharing.isAvailableAsync() : false;
+      if (Sharing && canShare) {
         await Sharing.shareAsync(fileUri, {
           mimeType: "application/pdf",
           dialogTitle: "Partager le rapport PDF",
@@ -637,8 +884,15 @@ export default function App() {
         Alert.alert("Export termine", `Rapport sauvegarde: ${fileUri}`);
       }
     } catch (error) {
+      const httpStatus = parseHttpStatusFromError(error?.message);
       if (error.message === "TIMEOUT") {
         Alert.alert("Timeout", "L'export du rapport a pris trop de temps.");
+      } else if (error.message === "AUTH_REQUIRED") {
+        Alert.alert("Session expiree", "Authentification requise. Veuillez vous reconnecter.");
+      } else if (httpStatus === 404) {
+        Alert.alert("Erreur serveur", "Route d'export rapport introuvable (404).");
+      } else if (httpStatus >= 500) {
+        Alert.alert("Erreur serveur", "Le serveur a retourne une erreur pendant l'export.");
       } else {
         Alert.alert("Erreur", "Impossible d'exporter le rapport PDF.");
       }
@@ -649,17 +903,45 @@ export default function App() {
 
   async function previewReportPdf(path) {
     try {
-      const timestamp = Date.now();
-      const freshPath = `${path}${path.includes("?") ? "&" : "?"}_t=${timestamp}`;
-      const url = `${API_BASE_URL}${freshPath}`;
-      const canOpen = await Linking.canOpenURL(url);
-      if (!canOpen) {
-        Alert.alert("Erreur", "Impossible d'ouvrir l'aperçu PDF.");
+      if (!authToken) {
+        Alert.alert("Session expiree", "Veuillez vous reconnecter.");
         return;
       }
-      await Linking.openURL(url);
-    } catch {
-      Alert.alert("Erreur", "Impossible d'ouvrir l'aperçu PDF.");
+      const FileSystem = await getFileSystemModule();
+      const baseDir = FileSystem?.documentDirectory;
+      if (!FileSystem || !baseDir) {
+        Alert.alert("Erreur", "Stockage local indisponible sur cet appareil.");
+        return;
+      }
+      const timestamp = Date.now();
+      const freshPath = `${path}${path.includes("?") ? "&" : "?"}_t=${timestamp}`;
+      const previewUri = `${baseDir}apercu-rapport-${timestamp}.pdf`;
+      const downloadResult = await withTimeout(
+        FileSystem.downloadAsync(`${API_BASE_URL}${freshPath}`, previewUri, {
+          headers: { Authorization: `Bearer ${authToken}` },
+        }),
+        20000
+      );
+      if (downloadResult?.status && downloadResult.status >= 400) {
+        throw new Error(downloadResult.status === 401 ? "AUTH_REQUIRED" : toHttpError(downloadResult.status));
+      }
+
+      const localPdfUri = downloadResult?.uri || previewUri;
+      const opened = await openPdfWithBestEffort(localPdfUri, "Apercu du rapport PDF");
+      if (!opened) {
+        Alert.alert("Erreur", "Impossible d'ouvrir l'apercu PDF.");
+      }
+    } catch (error) {
+      const httpStatus = parseHttpStatusFromError(error?.message);
+      if (error.message === "AUTH_REQUIRED") {
+        Alert.alert("Session expiree", "Authentification requise. Veuillez vous reconnecter.");
+      } else if (httpStatus === 404) {
+        Alert.alert("Erreur serveur", "Route d'apercu rapport introuvable (404).");
+      } else if (httpStatus >= 500) {
+        Alert.alert("Erreur serveur", "Le serveur a retourne une erreur sur l'apercu du rapport.");
+      } else {
+        Alert.alert("Erreur", "Impossible d'ouvrir l'apercu PDF.");
+      }
     }
   }
 
@@ -751,7 +1033,7 @@ export default function App() {
   function renderReportDetails(report) {
     const reportSales = Array.isArray(report?.sales) ? report.sales : [];
     if (reportSales.length === 0) {
-      return <Text style={styles.emptyText}>Aucune vente dans cette periode.</Text>;
+      return <Text style={styles.emptyText}>Aucun enregistrement dans cette periode.</Text>;
     }
 
     return (
@@ -760,14 +1042,20 @@ export default function App() {
           const items = parseItemsFromSale(sale);
           return (
             <View key={sale._id} style={styles.reportSaleItem}>
-              <Text style={styles.reportSaleTitle}>Vente #{String(sale._id).slice(-6)}</Text>
+              <Text style={styles.reportSaleTitle}>{activeModuleConfig.singular} #{String(sale._id).slice(-6)}</Text>
               <Text style={styles.reportSaleMeta}>{new Date(sale.createdAt).toLocaleString("fr-FR")}</Text>
-              {items.map((line, index) => (
-                <Text key={`${sale._id}-${index}`} style={styles.reportSaleLine}>
-                  {index + 1}. {line.productName} | Qt: {line.quantity} | PU: {line.unitPrice} XOF
-                </Text>
-              ))}
-              <Text style={styles.reportSaleTotal}>Total: {sale.totalPrice} XOF</Text>
+              {activeModule === "purchases" && sale?.supplier ? (
+                <Text style={styles.reportSaleMeta}>Fournisseur: {sale.supplier}</Text>
+              ) : null}
+              {activeModule === "purchases" && sale?.invoiceRef ? (
+                <Text style={styles.reportSaleMeta}>Ref facture: {sale.invoiceRef}</Text>
+              ) : null}
+                {items.map((line, index) => (
+                  <Text key={`${sale._id}-${index}`} style={styles.reportSaleLine}>
+                    {index + 1}. {line.productName} | Qt: {line.quantity} | PU: {formatMoney(line.unitPrice)}
+                  </Text>
+                ))}
+              <Text style={styles.reportSaleTotal}>Total: {formatMoney(sale.totalPrice)}</Text>
             </View>
           );
         })}
@@ -803,7 +1091,7 @@ export default function App() {
             onChangeText={(value) => updateFn(index, "unitPrice", value)}
           />
 
-          <Text style={styles.lineTotal}>Sous-total: {Number.isFinite(lineTotal) ? lineTotal : 0} XOF</Text>
+          <Text style={styles.lineTotal}>Sous-total: {formatMoney(Number.isFinite(lineTotal) ? lineTotal : 0)}</Text>
 
           <TouchableOpacity
             style={[styles.miniDangerButton, lines.length === 1 && styles.disabledButton]}
@@ -825,7 +1113,7 @@ export default function App() {
             <Text style={styles.backLinkText}>{"<"} Retour Accueil</Text>
           </TouchableOpacity>
           <Text style={styles.panelTitle}>Rapport Journalier</Text>
-          <Text style={styles.panelSubtitle}>Consultez le detail d'une date precise.</Text>
+          <Text style={styles.panelSubtitle}>{`Consultez le detail des ${activeModuleConfig.reportPluralLower} d'une date.`}</Text>
           <TextInput
             style={styles.input}
             placeholder="YYYY-MM-DD"
@@ -855,12 +1143,12 @@ export default function App() {
           {showDailyDetails && (
             <>
               <Text style={styles.reportText}>
-                Ventes: {dailyReport?.salesCount ?? 0} | Total: {dailyReport?.totalAmount ?? 0} XOF
+                {activeModuleConfig.plural}: {dailyReport?.salesCount ?? 0} | Total: {formatMoney(dailyReport?.totalAmount ?? 0)}
               </Text>
               <View style={styles.reportActions}>
                 <TouchableOpacity
                   style={styles.miniButton}
-                  onPress={() => previewReportPdf(`/api/sales/reports/daily/export.pdf?date=${encodeURIComponent(reportDate)}`)}
+                  onPress={() => previewReportPdf(`${getActiveApiBase()}/reports/daily/export.pdf?date=${encodeURIComponent(reportDate)}`)}
                 >
                   <Text style={styles.miniButtonText}>Apercu PDF</Text>
                 </TouchableOpacity>
@@ -868,8 +1156,8 @@ export default function App() {
                   style={styles.reportPrimaryButton}
                   onPress={() =>
                     exportReportPdf(
-                      `/api/sales/reports/daily/export.pdf?date=${encodeURIComponent(reportDate)}`,
-                      `rapport-journalier-${reportDate || "date"}.pdf`,
+                      `${getActiveApiBase()}/reports/daily/export.pdf?date=${encodeURIComponent(reportDate)}`,
+                      `rapport-journalier-${activeModuleConfig.key}-${reportDate || "date"}.pdf`,
                       "daily"
                     )
                   }
@@ -892,7 +1180,7 @@ export default function App() {
             <Text style={styles.backLinkText}>{"<"} Retour Accueil</Text>
           </TouchableOpacity>
           <Text style={styles.panelTitle}>Rapport Hebdomadaire</Text>
-          <Text style={styles.panelSubtitle}>Detail des ventes sur une semaine.</Text>
+          <Text style={styles.panelSubtitle}>{`Detail des ${activeModuleConfig.reportPluralLower} sur une semaine.`}</Text>
           <TextInput
             style={styles.input}
             placeholder="YYYY-MM-DD"
@@ -925,12 +1213,12 @@ export default function App() {
                 Semaine: {weeklyReport?.from ?? "-"} au {weeklyReport?.to ?? "-"}
               </Text>
               <Text style={styles.reportText}>
-                Ventes: {weeklyReport?.salesCount ?? 0} | Total: {weeklyReport?.totalAmount ?? 0} XOF
+                {activeModuleConfig.plural}: {weeklyReport?.salesCount ?? 0} | Total: {formatMoney(weeklyReport?.totalAmount ?? 0)}
               </Text>
               <View style={styles.reportActions}>
                 <TouchableOpacity
                   style={styles.miniButton}
-                  onPress={() => previewReportPdf(`/api/sales/reports/weekly/export.pdf?date=${encodeURIComponent(weeklyDate)}`)}
+                  onPress={() => previewReportPdf(`${getActiveApiBase()}/reports/weekly/export.pdf?date=${encodeURIComponent(weeklyDate)}`)}
                 >
                   <Text style={styles.miniButtonText}>Apercu PDF</Text>
                 </TouchableOpacity>
@@ -938,8 +1226,8 @@ export default function App() {
                   style={styles.reportPrimaryButton}
                   onPress={() =>
                     exportReportPdf(
-                      `/api/sales/reports/weekly/export.pdf?date=${encodeURIComponent(weeklyDate)}`,
-                      `rapport-hebdomadaire-${weeklyDate || "date"}.pdf`,
+                      `${getActiveApiBase()}/reports/weekly/export.pdf?date=${encodeURIComponent(weeklyDate)}`,
+                      `rapport-hebdomadaire-${activeModuleConfig.key}-${weeklyDate || "date"}.pdf`,
                       "weekly"
                     )
                   }
@@ -994,14 +1282,14 @@ export default function App() {
           {showRangeDetails && (
             <>
               <Text style={styles.reportText}>
-                Ventes: {rangeReport?.salesCount ?? 0} | Total: {rangeReport?.totalAmount ?? 0} XOF
+                {activeModuleConfig.plural}: {rangeReport?.salesCount ?? 0} | Total: {formatMoney(rangeReport?.totalAmount ?? 0)}
               </Text>
               <View style={styles.reportActions}>
                 <TouchableOpacity
                   style={styles.miniButton}
                   onPress={() =>
                     previewReportPdf(
-                      `/api/sales/reports/range/export.pdf?from=${encodeURIComponent(rangeFrom)}&to=${encodeURIComponent(rangeTo)}`
+                      `${getActiveApiBase()}/reports/range/export.pdf?from=${encodeURIComponent(rangeFrom)}&to=${encodeURIComponent(rangeTo)}`
                     )
                   }
                 >
@@ -1011,8 +1299,8 @@ export default function App() {
                   style={styles.reportPrimaryButton}
                   onPress={() =>
                     exportReportPdf(
-                      `/api/sales/reports/range/export.pdf?from=${encodeURIComponent(rangeFrom)}&to=${encodeURIComponent(rangeTo)}`,
-                      `rapport-intervalle-${rangeFrom || "from"}-${rangeTo || "to"}.pdf`,
+                      `${getActiveApiBase()}/reports/range/export.pdf?from=${encodeURIComponent(rangeFrom)}&to=${encodeURIComponent(rangeTo)}`,
+                      `rapport-intervalle-${activeModuleConfig.key}-${rangeFrom || "from"}-${rangeTo || "to"}.pdf`,
                       "range"
                     )
                   }
@@ -1031,17 +1319,17 @@ export default function App() {
     return (
       <View style={styles.panel}>
         <Text style={styles.panelTitle}>Tableau de bord</Text>
-        <Text style={styles.panelSubtitle}>Acces rapide aux rapports de ventes.</Text>
+        <Text style={styles.panelSubtitle}>{`Acces rapide aux rapports de ${activeModuleConfig.reportPluralLower}.`}</Text>
         {offlineMode ? <Text style={styles.offlineBadge}>Mode hors ligne actif (donnees du mobile)</Text> : null}
 
         <View style={styles.kpiGrid}>
           <View style={styles.kpiCard}>
-            <Text style={styles.kpiLabel}>Nombre de ventes</Text>
+            <Text style={styles.kpiLabel}>{`Nombre de ${activeModuleConfig.reportPluralLower}`}</Text>
             <Text style={styles.kpiValue}>{sales.length}</Text>
           </View>
           <View style={styles.kpiCard}>
             <Text style={styles.kpiLabel}>Montant total</Text>
-            <Text style={styles.kpiValue}>{totalAmount} XOF</Text>
+            <Text style={styles.kpiValue}>{formatMoney(totalAmount)}</Text>
           </View>
         </View>
 
@@ -1081,8 +1369,24 @@ export default function App() {
   function renderCreate() {
     return (
       <View style={styles.panel}>
-        <Text style={styles.panelTitle}>Nouvelle vente</Text>
+        <Text style={styles.panelTitle}>{`Nouveau ${activeModuleConfig.singular.toLowerCase()}`}</Text>
         <Text style={styles.panelSubtitle}>Ajoutez un ou plusieurs produits.</Text>
+        {activeModule === "purchases" ? (
+          <>
+            <TextInput
+              style={styles.input}
+              placeholder="Fournisseur (optionnel)"
+              value={supplierName}
+              onChangeText={setSupplierName}
+            />
+            <TextInput
+              style={styles.input}
+              placeholder="Reference facture (optionnel)"
+              value={invoiceRef}
+              onChangeText={setInvoiceRef}
+            />
+          </>
+        ) : null}
 
         {renderLineEditor(productLines, updateCreateLine, addCreateLine, removeCreateLine)}
 
@@ -1091,12 +1395,12 @@ export default function App() {
         </TouchableOpacity>
 
         <View style={styles.totalCard}>
-          <Text style={styles.totalLabel}>Montant total de la vente</Text>
-          <Text style={styles.totalValue}>{createTotal} XOF</Text>
+          <Text style={styles.totalLabel}>{`Montant total de ${activeModuleConfig.singular.toLowerCase()}`}</Text>
+          <Text style={styles.totalValue}>{formatMoney(createTotal)}</Text>
         </View>
 
         <TouchableOpacity style={styles.primaryButton} onPress={handleCreateSale} disabled={loadingCreate}>
-          {loadingCreate ? <ActivityIndicator color="#ffffff" /> : <Text style={styles.primaryButtonText}>Enregistrer la vente</Text>}
+          {loadingCreate ? <ActivityIndicator color="#ffffff" /> : <Text style={styles.primaryButtonText}>{`Enregistrer ${activeModuleConfig.singular.toLowerCase()}`}</Text>}
         </TouchableOpacity>
       </View>
     );
@@ -1107,7 +1411,7 @@ export default function App() {
       <View style={styles.panel}>
         <View style={styles.historyHeader}>
           <View>
-            <Text style={styles.panelTitle}>Historique des ventes</Text>
+            <Text style={styles.panelTitle}>{`Historique des ${activeModuleConfig.reportPluralLower}`}</Text>
             <Text style={styles.panelSubtitle}>Modification et suppression rapides.</Text>
           </View>
           <TouchableOpacity style={styles.refreshChip} onPress={loadSales}>
@@ -1119,7 +1423,7 @@ export default function App() {
           <Text style={styles.reportTitle}>Filtre de recherche</Text>
           <TextInput
             style={styles.input}
-            placeholder="Nom produit (ex: routeur)"
+            placeholder={activeModule === "purchases" ? "Produit, fournisseur ou ref facture" : "Nom produit (ex: routeur)"}
             value={searchText}
             onChangeText={setSearchText}
           />
@@ -1147,7 +1451,23 @@ export default function App() {
 
         {editingId ? (
           <View style={styles.editBox}>
-            <Text style={styles.editTitle}>Modifier la vente</Text>
+            <Text style={styles.editTitle}>{`Modifier ${activeModuleConfig.singular.toLowerCase()}`}</Text>
+            {activeModule === "purchases" ? (
+              <>
+                <TextInput
+                  style={styles.input}
+                  placeholder="Fournisseur (optionnel)"
+                  value={editSupplierName}
+                  onChangeText={setEditSupplierName}
+                />
+                <TextInput
+                  style={styles.input}
+                  placeholder="Reference facture (optionnel)"
+                  value={editInvoiceRef}
+                  onChangeText={setEditInvoiceRef}
+                />
+              </>
+            ) : null}
 
             {renderLineEditor(editLines, updateEditLine, addEditLine, removeEditLine)}
 
@@ -1157,7 +1477,7 @@ export default function App() {
 
             <View style={styles.totalCard}>
               <Text style={styles.totalLabel}>Nouveau montant total</Text>
-              <Text style={styles.totalValue}>{editTotal} XOF</Text>
+              <Text style={styles.totalValue}>{formatMoney(editTotal)}</Text>
             </View>
 
             <View style={styles.inlineActions}>
@@ -1174,21 +1494,28 @@ export default function App() {
         {loadingHistory ? (
           <ActivityIndicator color="#0f766e" style={styles.loader} />
         ) : sales.length === 0 ? (
-          <Text style={styles.emptyText}>Aucune vente disponible.</Text>
+          <Text style={styles.emptyText}>{`Aucun ${activeModuleConfig.singular.toLowerCase()} disponible.`}</Text>
         ) : (
           sales.map((item) => {
+            const isAdmin = String(currentUser?.role || "").toLowerCase() === "admin";
             const items = parseItemsFromSale(item);
             const ownerId = normalizeOwnerId(item?.createdBy);
-            const canManage = Boolean(ownerId) && ownerId === currentUserId;
+            const canManage = isAdmin || (Boolean(ownerId) && ownerId === currentUserId);
             return (
               <View key={item._id} style={styles.saleCard}>
-                <Text style={styles.saleName}>Vente #{String(item._id).slice(-6)}</Text>
+                <Text style={styles.saleName}>{`${activeModuleConfig.singular} #${String(item._id).slice(-6)}`}</Text>
+                {activeModule === "purchases" && item?.supplier ? (
+                  <Text style={styles.saleLine}>Fournisseur: {item.supplier}</Text>
+                ) : null}
+                {activeModule === "purchases" && item?.invoiceRef ? (
+                  <Text style={styles.saleLine}>Ref facture: {item.invoiceRef}</Text>
+                ) : null}
                 {items.map((line, index) => (
                   <Text key={`${item._id}-${index}`} style={styles.saleLine}>
-                    {index + 1}. {line.productName} | Qt: {line.quantity} | PU: {line.unitPrice} XOF
+                    {index + 1}. {line.productName} | Qt: {line.quantity} | PU: {formatMoney(line.unitPrice)}
                   </Text>
                 ))}
-                <Text style={styles.saleTotal}>Total: {item.totalPrice} XOF</Text>
+                <Text style={styles.saleTotal}>Total: {formatMoney(item.totalPrice)}</Text>
 
                 <View style={styles.saleActions}>
                   {canManage ? (
@@ -1214,7 +1541,7 @@ export default function App() {
                   </TouchableOpacity>
                   <TouchableOpacity
                     style={styles.miniButton}
-                    onPress={() => downloadAndShareReceipt(item._id, items[0]?.productName || "vente")}
+                    onPress={() => downloadAndShareReceipt(item._id, items[0]?.productName || activeModuleConfig.singular.toLowerCase())}
                     disabled={downloadingId === item._id}
                   >
                     {downloadingId === item._id ? <ActivityIndicator color="#0f172a" /> : <Text style={styles.miniButtonText}>Envoyer</Text>}
@@ -1235,7 +1562,7 @@ export default function App() {
         <View style={styles.loginWrap}>
           <View style={styles.loginCard}>
             <Text style={styles.loginTitle}>Connexion</Text>
-            <Text style={styles.loginSubtitle}>Entrez vos identifiants pour acceder a la gestion des ventes.</Text>
+            <Text style={styles.loginSubtitle}>Entrez vos identifiants pour acceder a la gestion commerciale.</Text>
             <TextInput
               style={styles.input}
               placeholder="Email"
@@ -1254,7 +1581,6 @@ export default function App() {
             <TouchableOpacity style={styles.primaryButton} onPress={handleLogin} disabled={loggingIn}>
               {loggingIn ? <ActivityIndicator color="#ffffff" /> : <Text style={styles.primaryButtonText}>Se connecter</Text>}
             </TouchableOpacity>
-            <Text style={styles.loginHint}>Compte par defaut: admin@sahelconnect.com / Admin@1234</Text>
           </View>
         </View>
       </SafeAreaView>
@@ -1262,10 +1588,24 @@ export default function App() {
     <SafeAreaView style={styles.container}>
       <StatusBar style="dark" />
       <View style={styles.headerBlock}>
-        <Text style={styles.title}>Gestion de Vente</Text>
+        <Text style={styles.title}>Gestion Commerciale</Text>
         <Text style={styles.subtitle}>
           {currentUser ? `${currentUser.fullName} (${currentUser.role})` : "Application de suivi commercial."}
         </Text>
+        <View style={styles.moduleSwitch}>
+          <TouchableOpacity
+            style={[styles.moduleChip, activeModule === "sales" && styles.moduleChipActive]}
+            onPress={() => setActiveModule("sales")}
+          >
+            <Text style={[styles.moduleChipText, activeModule === "sales" && styles.moduleChipTextActive]}>Vente</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.moduleChip, activeModule === "purchases" && styles.moduleChipActive]}
+            onPress={() => setActiveModule("purchases")}
+          >
+            <Text style={[styles.moduleChipText, activeModule === "purchases" && styles.moduleChipTextActive]}>Achat</Text>
+          </TouchableOpacity>
+        </View>
         <TouchableOpacity style={styles.logoutButton} onPress={handleLogout}>
           <Text style={styles.logoutButtonText}>Deconnexion</Text>
         </TouchableOpacity>
@@ -1293,6 +1633,59 @@ export default function App() {
       </View>
     </SafeAreaView>
     )
+  );
+}
+
+class AppErrorBoundary extends React.Component {
+  constructor(props) {
+    super(props);
+    this.state = { hasError: false, message: "" };
+  }
+
+  static getDerivedStateFromError(error) {
+    return {
+      hasError: true,
+      message: error?.message || "Erreur inattendue au demarrage.",
+    };
+  }
+
+  componentDidCatch(error) {
+    try {
+      console.error("AppErrorBoundary:", error);
+    } catch {
+      // no-op
+    }
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <SafeAreaView style={styles.container}>
+          <StatusBar style="dark" />
+          <View style={styles.loginWrap}>
+            <View style={styles.loginCard}>
+              <Text style={styles.loginTitle}>Erreur application</Text>
+              <Text style={styles.loginSubtitle}>
+                {this.state.message || "Une erreur est survenue au lancement."}
+              </Text>
+              <Text style={styles.loginSubtitle}>
+                Redemarrez l'application. Si le probleme persiste, contactez le support avec ce message.
+              </Text>
+            </View>
+          </View>
+        </SafeAreaView>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
+export default function App() {
+  return (
+    <AppErrorBoundary>
+      <MainApp />
+    </AppErrorBoundary>
   );
 }
 
@@ -1328,11 +1721,6 @@ const styles = StyleSheet.create({
     marginTop: 4,
     marginBottom: 12,
   },
-  loginHint: {
-    marginTop: 10,
-    color: "#64748b",
-    fontSize: 12,
-  },
   title: {
     fontSize: 40,
     lineHeight: 42,
@@ -1345,6 +1733,31 @@ const styles = StyleSheet.create({
     color: "#475569",
     fontSize: 14,
     fontWeight: "500",
+  },
+  moduleSwitch: {
+    flexDirection: "row",
+    gap: 8,
+    marginTop: 10,
+  },
+  moduleChip: {
+    borderWidth: 1,
+    borderColor: "#cbd5e1",
+    borderRadius: 10,
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    backgroundColor: "#ffffff",
+  },
+  moduleChipActive: {
+    borderColor: "#0ea5e9",
+    backgroundColor: "#e0f2fe",
+  },
+  moduleChipText: {
+    color: "#334155",
+    fontWeight: "700",
+    fontSize: 12,
+  },
+  moduleChipTextActive: {
+    color: "#0369a1",
   },
   logoutButton: {
     marginTop: 8,
@@ -1886,3 +2299,4 @@ const styles = StyleSheet.create({
     color: "#ffffff",
   },
 });
+
